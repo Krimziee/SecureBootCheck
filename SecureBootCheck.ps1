@@ -27,13 +27,22 @@ $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host 'Admin rights are needed to READ the Secure Boot and TPM settings - click "Yes" on the prompt.'
     Write-Host 'They are only used for reading. This tool makes no changes to your PC.'
+    if ($PSCommandPath) {
+        $arguments = '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`""
+    } else {
+        # Started from memory (irm ... | iex): load it from GitHub again in the admin window
+        $url = 'https://raw.githubusercontent.com/Krimziee/SecureBootCheck/main/SecureBootCheck.ps1'
+        $command = "[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12; " +
+                   "& ([scriptblock]::Create((Invoke-RestMethod -Uri '$url' -UseBasicParsing)))"
+        $arguments = '-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
+    }
     try {
-        Start-Process powershell.exe -Verb RunAs -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`""
+        Start-Process powershell.exe -Verb RunAs -ArgumentList $arguments
     } catch {
         Write-Host 'Could not get admin rights. Start the check again and click "Yes".' -ForegroundColor Red
         if (-not $NoPause) { Read-Host 'Press Enter to close' | Out-Null }
     }
-    exit
+    return   # not "exit": when run with "irm ... | iex", exit would close the player's PowerShell window
 }
 
 # ------------------------------------------------------------------

@@ -8,9 +8,23 @@ Games with kernel anti-cheat often refuse to start unless **Secure Boot** and **
 
 ## How to use it
 
-1. Download the latest zip from **Releases** (or the green **Code** button → **Download ZIP**) and unpack it.
+### Option 1: one command (quickest)
+
+Right-click the Start button, open **Terminal** or **PowerShell**, then paste this and press Enter:
+
+```powershell
+irm https://raw.githubusercontent.com/Krimziee/SecureBootCheck/main/run.ps1 | iex
+```
+
+Click **Yes** when Windows asks for admin rights. The firmware settings can only be read with them. The check opens in a new window.
+
+Nothing is downloaded to your PC: the newest version is loaded straight from this repository into memory and run.
+
+### Option 2: download it
+
+1. Download the latest zip from **[Releases](https://github.com/Krimziee/SecureBootCheck/releases/latest)** and unpack it.
 2. Double-click **`Check Secure Boot.cmd`**.
-3. Click **Yes** when Windows asks for admin rights. The firmware settings can only be read with them.
+3. Click **Yes** when Windows asks for admin rights.
 
 Works on Windows 10 and Windows 11.
 
