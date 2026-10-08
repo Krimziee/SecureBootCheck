@@ -17,7 +17,7 @@
 #>
 param([switch]$NoPause)
 
-$script:Version = '1.0.1'
+$script:Version = '1.0.2'
 
 # ------------------------------------------------------------------
 #  Admin rights: the firmware variables can only be read as admin
@@ -201,18 +201,26 @@ function Get-UefiSupportFlag {
 function Get-CpuTpmSupport {
     <#
         Guesses from the processor whether it has a TPM 2.0 built in
-        (Intel PTT / AMD fTPM): 'Yes', 'Maybe', 'No' or 'Unknown'.
-        Based on the processor generation, so it is a strong hint, not proof.
+        (Intel PTT / AMD fTPM / Microsoft Pluton): 'Yes', 'Maybe', 'No' or 'Unknown'.
+        Known old processors are recognised by name. Anything else - including
+        processors released after this script was written - is judged by the
+        age of the firmware, so new processors count as having one.
+        A strong hint, not proof.
     #>
-    param([string]$Name, [string]$Vendor)
+    param([string]$Name, [string]$Vendor, $BiosDate)
+
+    if ($Vendor -eq 'Qualcomm' -or $Name -match 'Snapdragon|Qualcomm') { return 'Yes' }   # every Windows-on-ARM PC
+
     if ($Vendor -eq 'AMD') {
         if ($Name -match 'Ryzen|Threadripper|EPYC') { return 'Yes' }           # every Zen processor has fTPM
         if ($Name -match 'Athlon.*\b(2\d\dGE?|3\d\d\dG[EU]?|Gold|Silver)\b') { return 'Yes' }   # Zen-based Athlons
         if ($Name -match '\bFX(\(tm\))?-|Phenom|Athlon(\(tm\))? (II|64)|Sempron|Opteron') { return 'No' }
-        return 'Unknown'
     }
+
     if ($Vendor -eq 'Intel') {
-        if ($Name -match 'Core\(TM\) Ultra|Core Ultra') { return 'Yes' }
+        if ($Name -match 'Core\(TM\) Ultra|Core Ultra') { return 'Yes' }                     # Core Ultra, every generation
+        if ($Name -match 'Core(\(TM\))? [3579] \d{3}') { return 'Yes' }                       # Core 3/5/7/9 without the "i" (2024+)
+        if ($Name -match 'Intel(\(R\))? (Processor )?N\d{2,3}\b|Core(\(TM\))? i3-N\d{3}') { return 'Yes' }   # N100, N150, N200, N305...
         if ($Name -match 'Core\(TM\)2|Core 2|Pentium\(R\) (4|D)\b') { return 'No' }
         if ($Name -match '\bi[3579]-(\d{3,5})') {
             $model = $Matches[1]
@@ -224,6 +232,16 @@ function Get-CpuTpmSupport {
             if ($gen -ge 4) { return 'Maybe' }   # PTT exists, but not every motherboard offers it
             return 'No'
         }
+    }
+
+    # Not recognised by name (Pentium, Celeron, Xeon, other or future processors): go by the firmware's age.
+    # Built-in TPMs arrived around 2013 and are in practically every PC since about 2018.
+    # A BIOS update makes the date newer, so this leans towards "Yes" - hence only a hint.
+    if ($Vendor -in 'Intel', 'AMD' -and $BiosDate) {
+        $year = ([datetime]$BiosDate).Year
+        if ($year -ge 2018) { return 'Yes' }
+        if ($year -ge 2013) { return 'Maybe' }
+        return 'No'
     }
     'Unknown'
 }
@@ -325,7 +343,7 @@ function Test-System {
         Vm        = $vm
         IsLaptop  = $isLaptop
         CpuName   = "$($cpu.Name)".Trim()
-        CpuVendor = switch -Wildcard ($cpu.Manufacturer) { 'AuthenticAMD' { 'AMD' } 'GenuineIntel' { 'Intel' } default { 'Other' } }
+        CpuVendor = switch -Wildcard ($cpu.Manufacturer) { 'AuthenticAMD' { 'AMD' } 'GenuineIntel' { 'Intel' } '*Qualcomm*' { 'Qualcomm' } default { 'Other' } }
         BiosDate  = $bios.ReleaseDate
         IsWin11   = [int]$os.BuildNumber -ge 22000
         Bios      = if (-not $vm) { Get-BiosKey -ComputerSystem $cs -IsLaptop $isLaptop }
@@ -647,7 +665,7 @@ function Test-Tpm {
             )
         } else {
             # A switched-off TPM is invisible to Windows, so the processor decides how likely each answer is
-            $cpuTpm = Get-CpuTpmSupport -Name $Pc.CpuName -Vendor $Pc.CpuVendor
+            $cpuTpm = Get-CpuTpmSupport -Name $Pc.CpuName -Vendor $Pc.CpuVendor -BiosDate $Pc.BiosDate
             $module = 'A separate TPM 2.0 module that plugs into the motherboard - only if the board has a "TPM" connector (check the motherboard manual). Without one, this PC cannot get TPM 2.0.'
             switch ($cpuTpm) {
                 'Yes' {
