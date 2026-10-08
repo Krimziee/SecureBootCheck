@@ -26,7 +26,11 @@ Nothing is downloaded to your PC: the newest version is loaded straight from thi
 2. Double-click **`Check Secure Boot.cmd`**.
 3. Click **Yes** when Windows asks for admin rights.
 
-Works on Windows 10 and Windows 11.
+This opens the check in a window: your PC and every check on the left, the result and the fix steps on the right. Commands in the fix steps can be selected and copied, but the window never runs them. It has no button that changes anything. **Check again** runs the check once more after you've made a change.
+
+The one-command version (Option 1) shows the same check as text.
+
+Works on Windows 10 and Windows 11. The check is also a tab in Krimz's Toolkit, which shows the same window.
 
 ## What it checks
 
@@ -106,7 +110,7 @@ Windows may show **"Windows protected your PC"** because the file was downloaded
 powershell -ExecutionPolicy Bypass -File .\SecureBootCheck.ps1
 ```
 
-Add `-NoPause` to close the window right away when it's finished.
+This shows the text version. Add `-NoPause` to close the window right away when it's finished, or `-Window` to open the window instead.
 
 ## License
 

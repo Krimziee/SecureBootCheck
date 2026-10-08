@@ -13,9 +13,12 @@
     setuperr.log files to C:\Windows.
 
     Run:  powershell -ExecutionPolicy Bypass -File SecureBootCheck.ps1
-          (or double-click "Check Secure Boot.cmd" in this folder)
+          (text version; double-click "Check Secure Boot.cmd" for the window)
+          -Window     opens the window (modules\Ui.ps1) instead of the text version
+          -LoadOnly   only loads the checks (used by the window and Krimz's Toolkit);
+                      Invoke-SecureBootCheck then runs them and returns the results
 #>
-param([switch]$NoPause)
+param([switch]$NoPause, [switch]$Window, [switch]$LoadOnly)
 
 $script:Version = '1.0.2'
 
@@ -24,11 +27,12 @@ $script:Version = '1.0.2'
 # ------------------------------------------------------------------
 
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
-if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+if (-not $LoadOnly -and -not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host 'Admin rights are needed to READ the Secure Boot and TPM settings - click "Yes" on the prompt.'
     Write-Host 'They are only used for reading. This tool makes no changes to your PC.'
     if ($PSCommandPath) {
         $arguments = '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`""
+        if ($Window) { $arguments = @('-WindowStyle', 'Hidden') + $arguments + '-Window' }
     } else {
         # Started from memory (irm ... | iex): load it from GitHub again in the admin window
         $url = 'https://raw.githubusercontent.com/Krimziee/SecureBootCheck/main/SecureBootCheck.ps1'
@@ -39,16 +43,27 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     try {
         Start-Process powershell.exe -Verb RunAs -ArgumentList $arguments
     } catch {
-        Write-Host 'Could not get admin rights. Start the check again and click "Yes".' -ForegroundColor Red
-        if (-not $NoPause) { Read-Host 'Press Enter to close' | Out-Null }
+        if ($Window) {
+            # The window's launcher hides the console, so say it in a message box
+            Add-Type -AssemblyName PresentationFramework
+            [System.Windows.MessageBox]::Show('Could not get admin rights. They are only used to READ the Secure Boot and TPM settings. Start the check again and click "Yes".',
+                'Secure Boot & TPM 2.0 Check', 'OK', 'Information') | Out-Null
+        } else {
+            Write-Host 'Could not get admin rights. Start the check again and click "Yes".' -ForegroundColor Red
+            if (-not $NoPause) { Read-Host 'Press Enter to close' | Out-Null }
+        }
     }
     return   # not "exit": when run with "irm ... | iex", exit would close the player's PowerShell window
 }
 
 # ------------------------------------------------------------------
 #  Output helpers
+#  Every check records what it found in $script:Report (shown by the window)
+#  and, in the text version, also prints it straight away.
 # ------------------------------------------------------------------
 
+$script:ConsoleOutput = $false      # the text version sets this before running the checks
+$script:Report = New-Object System.Collections.Generic.List[object]
 $script:Problems = New-Object System.Collections.Generic.List[object]
 $script:Warnings = New-Object System.Collections.Generic.List[object]
 $script:BitLocker = $null           # filled in by Test-BitLocker
@@ -56,6 +71,8 @@ $script:NeedsConversion = $false    # the fix includes mbr2gpt /convert
 
 function Write-Section {
     param([string]$Title)
+    $script:Report.Add([pscustomobject]@{ Title = $Title; Items = New-Object System.Collections.Generic.List[object] })
+    if (-not $script:ConsoleOutput) { return }
     Write-Host ''
     Write-Host " $Title" -ForegroundColor Cyan
     Write-Host (' ' + ('-' * $Title.Length)) -ForegroundColor DarkCyan
@@ -67,6 +84,10 @@ function Write-Item {
         [string]$Value = '',
         [ValidateSet('Ok', 'Warn', 'Fail', 'Info')] [string]$Status = 'Info'
     )
+    if ($script:Report.Count) {
+        $script:Report[$script:Report.Count - 1].Items.Add([pscustomobject]@{ Label = $Label.Trim(); Value = $Value; Status = $Status })
+    }
+    if (-not $script:ConsoleOutput) { return }
     $tag, $color = switch ($Status) {
         'Ok'   { '[ OK ]', 'Green' }
         'Warn' { '[WARN]', 'Yellow' }
@@ -75,6 +96,40 @@ function Write-Item {
     }
     Write-Host "  $tag " -ForegroundColor $color -NoNewline
     Write-Host ("{0,-28} {1}" -f $Label, $Value)
+}
+
+function Write-Wrapped {
+    # Prints text word-wrapped to the console width; continuation lines get the same indent
+    param([string]$Text, [string]$First = '  ', [string]$Rest = '  ', [string]$Color)
+    $width = 100
+    try { $width = [math]::Min(100, [Console]::WindowWidth - 1) } catch { }
+    $line = $First
+    $hasWords = $false
+    $lines = @()
+    foreach ($word in $Text -split ' ') {
+        if ($hasWords -and ($line.Length + 1 + $word.Length) -gt $width) { $lines += $line; $line = $Rest + $word }
+        elseif ($hasWords) { $line += " $word" }
+        else { $line += $word }
+        $hasWords = $true
+    }
+    $lines += $line
+    foreach ($l in $lines) { if ($Color) { Write-Host $l -ForegroundColor $Color } else { Write-Host $l } }
+}
+
+function Write-Advice {
+    # Prints advice lines from Get-DataSafety (headings, paragraphs and bullet points)
+    param($Lines)
+    $colors = @{ Normal = $null; Warn = 'Yellow'; Fail = 'Red' }
+    $previous = $null
+    foreach ($l in $Lines) {
+        $color = $colors[$l.Tone]
+        switch ($l.Kind) {
+            'Heading' { Write-Host ''; Write-Wrapped $l.Text -Color $(if ($color) { $color } else { 'Yellow' }) }
+            'Text'    { if ($previous -ne 'Heading') { Write-Host '' }; Write-Wrapped $l.Text -Color $color }
+            'Bullet'  { Write-Wrapped $l.Text -First '     - ' -Rest '       ' -Color $color }
+        }
+        $previous = $l.Kind
+    }
 }
 
 # The order problems must be fixed in. Problems are listed in this order, not
@@ -103,17 +158,24 @@ function Add-Warning {
 # ------------------------------------------------------------------
 
 function Get-FirmwareType {
-    # Asks Windows directly how it was booted: 1 = Legacy BIOS, 2 = UEFI
-    if (-not ('SecureBootCheck.Native' -as [type])) {
-        Add-Type -Namespace SecureBootCheck -Name Native -MemberDefinition @'
-[DllImport("kernel32.dll")]
-public static extern bool GetFirmwareType(ref uint FirmwareType);
-'@
-    }
-    $type = [uint32]0
-    if ([SecureBootCheck.Native]::GetFirmwareType([ref]$type)) {
-        switch ($type) { 1 { return 'Legacy' } 2 { return 'UEFI' } }
-    }
+    # Asks Windows directly how it was booted: 1 = Legacy BIOS, 2 = UEFI.
+    # Declared in memory, not with Add-Type: that runs the C# compiler, which writes temporary files.
+    try {
+        $assembly = [AppDomain]::CurrentDomain.GetAssemblies() | Where-Object { $_.GetName().Name -eq 'SecureBootCheckFirmware' } | Select-Object -First 1
+        $native = if ($assembly) { $assembly.GetType('FirmwareNative') }
+        if (-not $native) {
+            $builder = [AppDomain]::CurrentDomain.DefineDynamicAssembly((New-Object Reflection.AssemblyName 'SecureBootCheckFirmware'), 'Run')
+            $type = $builder.DefineDynamicModule('SecureBootCheckFirmware').DefineType('FirmwareNative', 'Public, Class')
+            $method = $type.DefinePInvokeMethod('GetFirmwareType', 'kernel32.dll', 'Public, Static, PinvokeImpl', 'Standard', [bool],
+                                                [Type[]]@([uint32].MakeByRefType()), 'Winapi', 'Auto')
+            $method.SetImplementationFlags('PreserveSig')
+            $native = $type.CreateType()
+        }
+        $firmware = [uint32]0
+        if ($native::GetFirmwareType([ref]$firmware)) {
+            switch ($firmware) { 1 { return 'Legacy' } 2 { return 'UEFI' } }
+        }
+    } catch { }
     # Fallback: Windows also sets this variable at boot
     if ($env:firmware_type) { return $env:firmware_type }
     'Unknown'
@@ -804,92 +866,135 @@ function Test-BitLocker {
     }
 }
 
-function Show-DataSafety {
-    # Shown before the fixes: what each fix can do to the player's files, and how to stay safe
+function Get-DataSafety {
+    <#
+        Shown before the fixes: what each fix can do to the player's files, and
+        how to stay safe. Returns lines of advice (Kind: Heading, Text or Bullet;
+        Tone: Normal, Warn or Fail), or nothing when there is no risk to point out.
+    #>
     $bl = $script:BitLocker
     $blActive = $bl -and $bl.Encrypted
     if (-not ($blActive -or $script:NeedsConversion)) { return }
 
     $drive = $env:SystemDrive
-    Write-Host ''
-    Write-Host '  BEFORE YOU CHANGE ANYTHING - protect your files' -ForegroundColor Yellow
-    Write-Host '  ----------------------------------------------' -ForegroundColor Yellow
+    $line = { param($Kind, $Text, $Tone = 'Normal') [pscustomobject]@{ Kind = $Kind; Text = $Text; Tone = $Tone } }
 
     if ($blActive) {
-        Write-Host ''
-        Write-Host "  Your Windows drive ($drive) is encrypted with BitLocker / Device Encryption." -ForegroundColor Yellow
-        Write-Host '  Changing Secure Boot, CSM, boot mode, TPM settings or the disk layout makes Windows ask for the'
-        Write-Host '  48-digit BitLocker recovery key at the next start. Without that key, everything on'
-        Write-Host '  the drive is lost for good - nobody, not even Microsoft, can unlock it.'
+        & $line 'Heading' "Your Windows drive ($drive) is encrypted with BitLocker / Device Encryption." 'Warn'
+        & $line 'Text' 'Changing Secure Boot, CSM, boot mode, TPM settings or the disk layout makes Windows ask for the 48-digit BitLocker recovery key at the next start. Without that key, everything on the drive is lost for good - nobody, not even Microsoft, can unlock it.'
         if (-not $bl.HasRecovery) {
-            Write-Host ''
-            Write-Host '  !! This drive has NO recovery key. Do not change any BIOS setting until you add one:' -ForegroundColor Red
-            Write-Host "     - Add a key (admin PowerShell):  manage-bde -protectors -add $drive -RecoveryPassword" -ForegroundColor Red
+            & $line 'Text' 'This drive has NO recovery key. Do not change any BIOS setting until you add one:' 'Fail'
+            & $line 'Bullet' "Add a key (admin PowerShell):  manage-bde -protectors -add $drive -RecoveryPassword" 'Fail'
         }
-        Write-Host ''
-        Write-Host '  To stay safe:'
-        Write-Host "     - Show your recovery key now:  manage-bde -protectors -get $drive"
-        Write-Host '       Write the 48-digit "Numerical Password" down or photograph it with your phone.'
-        Write-Host '       If you sign in with a Microsoft account it may also be at aka.ms/myrecoverykey.'
+        & $line 'Text' 'To stay safe:'
+        & $line 'Bullet' "Show your recovery key now:  manage-bde -protectors -get $drive"
+        & $line 'Bullet' 'Write the 48-digit "Numerical Password" down or photograph it with your phone. If you sign in with a Microsoft account it may also be at aka.ms/myrecoverykey.'
         if ($bl.Protected) {
-            Write-Host "     - Then pause BitLocker:  manage-bde -protectors -disable $drive -RebootCount 2"
-            Write-Host '       Your files stay encrypted; it only stops the key prompt and turns itself back'
-            Write-Host '       on after 2 restarts. Do your BIOS changes within those 2 restarts.'
+            & $line 'Bullet' "Then pause BitLocker:  manage-bde -protectors -disable $drive -RebootCount 2"
+            & $line 'Bullet' 'Your files stay encrypted; pausing only stops the key prompt and turns itself back on after 2 restarts. Do your BIOS changes within those 2 restarts.'
         } else {
-            Write-Host '     - BitLocker is already paused, but it turns back on by itself after a restart.'
-            Write-Host '       Keep the recovery key at hand anyway.'
+            & $line 'Bullet' 'BitLocker is already paused, but it turns back on by itself after a restart. Keep the recovery key at hand anyway.'
         }
         if ($bl.Percent -lt 100) {
-            Write-Host "     - Encryption is still running ($($bl.Percent)%). Let it finish before you change anything." -ForegroundColor Yellow
+            & $line 'Bullet' "Encryption is still running ($($bl.Percent)%). Let it finish before you change anything." 'Warn'
         }
     }
 
     if ($script:NeedsConversion) {
-        Write-Host ''
-        Write-Host '  About converting the disk (mbr2gpt /convert):' -ForegroundColor Yellow
-        Write-Host '     - It is built to keep all your files, but it rewrites the layout of the disk. A power cut,'
-        Write-Host '       crash or forced shutdown while it runs can leave Windows unable to start.'
-        Write-Host '     - Only convert if your BIOS setup has a "UEFI" boot mode option - without one, Windows'
-        Write-Host '       will not start after converting.'
-        Write-Host '     - Back up anything you cannot re-download first (game saves, screenshots, documents,'
-        Write-Host '       photos) to a USB drive or cloud storage.'
-        Write-Host '     - On a laptop, plug in the charger. Close all programs and do not turn the PC off while it runs.'
-        Write-Host '     - Right after converting, Windows ONLY starts in UEFI mode. If you see "no bootable device",'
-        Write-Host '       your files are fine - switch the BIOS to UEFI mode. Switching back to Legacy will not work.'
-        Write-Host '     - If Linux or another system is installed on the same disk, it may stop starting.'
-        Write-Host '     - Do not use third-party "convert MBR to GPT" tools; mbr2gpt is the one built into Windows.'
+        & $line 'Heading' 'About converting the disk (mbr2gpt /convert):' 'Warn'
+        & $line 'Bullet' 'It is built to keep all your files, but it rewrites the layout of the disk. A power cut, crash or forced shutdown while it runs can leave Windows unable to start.'
+        & $line 'Bullet' 'Only convert if your BIOS setup has a "UEFI" boot mode option - without one, Windows will not start after converting.'
+        & $line 'Bullet' 'Back up anything you cannot re-download first (game saves, screenshots, documents, photos) to a USB drive or cloud storage.'
+        & $line 'Bullet' 'On a laptop, plug in the charger. Close all programs and do not turn the PC off while it runs.'
+        & $line 'Bullet' 'Right after converting, Windows ONLY starts in UEFI mode. If you see "no bootable device", your files are fine - switch the BIOS to UEFI mode. Switching back to Legacy will not work.'
+        & $line 'Bullet' 'If Linux or another system is installed on the same disk, it may stop starting.'
+        & $line 'Bullet' 'Do not use third-party "convert MBR to GPT" tools; mbr2gpt is the one built into Windows.'
     }
 }
 
-function Show-BiosAccess {
-    # How to get into the BIOS/UEFI setup, where almost every fix is made
+function Get-BiosAccess {
+    # How to get into the BIOS/UEFI setup, where almost every fix is made. Returns one line per tip.
     param($Pc, [string]$Firmware)
     if ($Pc.Vm) { return }   # VM fixes are made in the VM settings
-    Write-Host ''
-    Write-Host '  HOW TO OPEN THE BIOS/UEFI SETUP' -ForegroundColor Cyan
-    Write-Host '  -------------------------------' -ForegroundColor Cyan
     $b = $Pc.Bios
     if ($b -and $b.How) {
-        Write-Host "     - $($b.Brand): $($b.How)"
+        "$($b.Brand): $($b.How)"
     } elseif ($b) {
-        Write-Host "     - $($b.Brand) PC or motherboard: turn it on and keep pressing $($b.Key) until the setup screen opens."
+        "$($b.Brand) PC or motherboard: turn it on and keep pressing $($b.Key) until the setup screen opens."
     } else {
-        Write-Host '     - Turn the PC on and keep pressing Del or F2 (some PCs use F1, F10 or Esc).'
-        Write-Host '       The right key is often shown for a moment on the start screen.'
+        'Turn the PC on and keep pressing Del or F2 (some PCs use F1, F10 or Esc). The right key is often shown for a moment on the start screen.'
     }
     if ($Firmware -eq 'UEFI') {
         $path = if ($Pc.IsWin11) { 'Settings -> System -> Recovery -> Advanced startup' } else { 'Settings -> Update & Security -> Recovery -> Advanced startup' }
-        Write-Host "     - Or from Windows: $path -> Restart now,"
-        Write-Host '       then Troubleshoot -> Advanced options -> UEFI Firmware Settings -> Restart.'
+        "Or from Windows: $path -> Restart now, then Troubleshoot -> Advanced options -> UEFI Firmware Settings -> Restart."
     }
-    Write-Host '     - If Windows starts too fast to press the key: hold Shift while clicking Shut down, then try again.'
-    Write-Host '     - Changes only count after you choose "Save & Exit" (often F10).'
+    'If Windows starts too fast to press the key: hold Shift while clicking Shut down, then try again.'
+    'Changes only count after you choose "Save & Exit" (often F10).'
 }
 
 # ------------------------------------------------------------------
 #  Run
 # ------------------------------------------------------------------
 
+function Invoke-SecureBootCheck {
+    <#
+        Runs every check and returns everything the text version and the
+        window show. Only reads; can be run again (the window's "Check again").
+    #>
+    $script:Report   = New-Object System.Collections.Generic.List[object]
+    $script:Problems = New-Object System.Collections.Generic.List[object]
+    $script:Warnings = New-Object System.Collections.Generic.List[object]
+    $script:BitLocker = $null
+    $script:NeedsConversion = $false
+
+    $pc       = Test-System
+    $firmware = Test-BootMode -Pc $pc
+    Test-BootDisk -Firmware $firmware
+    $enabled  = $false
+    $keysChecked = $firmware -eq 'UEFI'
+    if ($keysChecked) {
+        $enabled = Test-SecureBootState
+        Test-FirmwareKeys -Enabled $enabled -Vm $pc.Vm
+    } else {
+        # The Secure Boot settings don't exist in Legacy mode, so they can only be checked after the switch to UEFI
+        Write-Section 'Secure Boot'
+        Write-Item 'Secure Boot' 'OFF (not available in Legacy mode)' 'Fail'
+        Write-Item 'Secure Boot keys' 'can only be checked once Windows starts in UEFI mode' 'Warn'
+    }
+    $tpmOk = Test-Tpm -Pc $pc
+    Test-BitLocker
+
+    [pscustomobject]@{
+        Version      = $script:Version
+        Pc           = $pc
+        Firmware     = $firmware
+        SecureBootOn = [bool]$enabled
+        TpmOk        = [bool]$tpmOk
+        KeysChecked  = $keysChecked
+        Sections     = $script:Report.ToArray()
+        Problems     = @($script:Problems | Sort-Object Order, Index)
+        Warnings     = $script:Warnings.ToArray()
+        DataSafety   = @(Get-DataSafety)
+        BiosAccess   = @(Get-BiosAccess -Pc $pc -Firmware $firmware)
+    }
+}
+
+if ($LoadOnly) { return }
+
+if ($Window) {
+    # The window: same checks, shown as cards (modules\Ui.ps1)
+    try {
+        . (Join-Path $PSScriptRoot 'modules\Ui.ps1')
+        Show-SecureBootWindow -Root $PSScriptRoot
+    } catch {
+        Add-Type -AssemblyName PresentationFramework
+        [System.Windows.MessageBox]::Show("The Secure Boot check couldn't open its window:`n$($_.Exception.Message)",
+            'Secure Boot & TPM 2.0 Check', 'OK', 'Error') | Out-Null
+    }
+    return
+}
+
+$script:ConsoleOutput = $true
 Clear-Host
 Write-Host " Secure Boot & TPM 2.0 check  v$script:Version" -ForegroundColor White
 Write-Host ''
@@ -900,34 +1005,29 @@ Write-Host ' |  files, disks, BitLocker or the TPM, and it never restarts.     |
 Write-Host ' |  Any fix it shows is for you to decide on and do yourself.      |' -ForegroundColor Green
 Write-Host ' +----------------------------------------------------------------+' -ForegroundColor Green
 
-$pc       = Test-System
-$firmware = Test-BootMode -Pc $pc
-Test-BootDisk -Firmware $firmware
-$enabled  = $false
-$keysChecked = $firmware -eq 'UEFI'
-if ($keysChecked) {
-    $enabled = Test-SecureBootState
-    Test-FirmwareKeys -Enabled $enabled -Vm $pc.Vm
-} else {
-    # The Secure Boot settings don't exist in Legacy mode, so they can only be checked after the switch to UEFI
-    Write-Section 'Secure Boot'
-    Write-Item 'Secure Boot' 'OFF (not available in Legacy mode)' 'Fail'
-    Write-Item 'Secure Boot keys' 'can only be checked once Windows starts in UEFI mode' 'Warn'
-}
-$tpmOk = Test-Tpm -Pc $pc
-Test-BitLocker
+$result = Invoke-SecureBootCheck
 
 Write-Section 'Result'
-Write-Item 'Secure Boot' $(if ($enabled) { 'ON' } else { 'OFF' }) $(if ($enabled) { 'Ok' } else { 'Fail' })
-Write-Item 'TPM 2.0' $(if ($tpmOk) { 'ready' } else { 'not ready' }) $(if ($tpmOk) { 'Ok' } else { 'Fail' })
+Write-Item 'Secure Boot' $(if ($result.SecureBootOn) { 'ON' } else { 'OFF' }) $(if ($result.SecureBootOn) { 'Ok' } else { 'Fail' })
+Write-Item 'TPM 2.0' $(if ($result.TpmOk) { 'ready' } else { 'not ready' }) $(if ($result.TpmOk) { 'Ok' } else { 'Fail' })
 Write-Host ''
-if ($enabled -and $tpmOk -and -not $script:Problems.Count) {
+if ($result.SecureBootOn -and $result.TpmOk -and -not $result.Problems.Count) {
     Write-Host '  Secure Boot and TPM 2.0 are set up properly - games that require them should run.' -ForegroundColor Green
 } else {
-    $count = $script:Problems.Count
+    $count = $result.Problems.Count
     Write-Host "  $count thing$(if ($count -ne 1) { 's' }) to fix before games that require Secure Boot / TPM 2.0 will run." -ForegroundColor Red
-    Show-DataSafety
-    Show-BiosAccess -Pc $pc -Firmware $firmware
+    if ($result.DataSafety.Count) {
+        Write-Host ''
+        Write-Host '  BEFORE YOU CHANGE ANYTHING - protect your files' -ForegroundColor Yellow
+        Write-Host '  ----------------------------------------------' -ForegroundColor Yellow
+        Write-Advice $result.DataSafety
+    }
+    if ($result.BiosAccess.Count) {
+        Write-Host ''
+        Write-Host '  HOW TO OPEN THE BIOS/UEFI SETUP' -ForegroundColor Cyan
+        Write-Host '  -------------------------------' -ForegroundColor Cyan
+        foreach ($tip in $result.BiosAccess) { Write-Wrapped $tip -First '     - ' -Rest '       ' }
+    }
     Write-Host ''
     Write-Host '  WHY, AND HOW TO FIX IT  (do the steps in this order)' -ForegroundColor Red
     Write-Host '  ----------------------------------------------------' -ForegroundColor Red
@@ -936,16 +1036,16 @@ if ($enabled -and $tpmOk -and -not $script:Problems.Count) {
 }
 
 $n = 0
-foreach ($problem in $script:Problems | Sort-Object Order, Index) {
+foreach ($problem in $result.Problems) {
     $n++
     Write-Host ''
     Write-Host "  Step $n. $($problem.Cause)" -ForegroundColor Red
     foreach ($step in $problem.Fix) { Write-Host "     - $step" }
 }
 
-if ($script:Problems.Count) {
+if ($result.Problems.Count) {
     Write-Host ''
-    if (-not $keysChecked) {
+    if (-not $result.KeysChecked) {
         Write-Host '  After these steps, run this check again. Some Secure Boot settings can only be' -ForegroundColor Cyan
         Write-Host '  checked once Windows starts in UEFI mode, so more steps may show up then.' -ForegroundColor Cyan
     } else {
@@ -953,7 +1053,7 @@ if ($script:Problems.Count) {
     }
 }
 
-foreach ($warning in $script:Warnings) {
+foreach ($warning in $result.Warnings) {
     Write-Host ''
     Write-Host "  Note: $($warning.Cause)" -ForegroundColor Yellow
     foreach ($step in $warning.Fix) { Write-Host "     - $step" }
