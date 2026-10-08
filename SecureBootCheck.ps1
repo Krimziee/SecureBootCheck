@@ -17,7 +17,7 @@
 #>
 param([switch]$NoPause)
 
-$script:Version = '1.0.0'
+$script:Version = '1.0.1'
 
 # ------------------------------------------------------------------
 #  Admin rights: the firmware variables can only be read as admin
@@ -165,6 +165,69 @@ function Get-SignatureCertificates {
     }
 }
 
+function Get-UefiSupportFlag {
+    <#
+        Reads the firmware's own description of itself (the SMBIOS "BIOS
+        Information" table) and returns whether it says it supports UEFI:
+        $true, $false, or $null when the firmware is too old to say.
+        Layout: byte 0 = table type (0 = BIOS info), byte 1 = length,
+        byte 0x13 = "characteristics extension byte 2", bit 3 = UEFI supported
+        (defined since SMBIOS 2.7, so older firmware can't be judged).
+    #>
+    try {
+        $raw = Get-CimInstance -Namespace root\wmi -ClassName MSSmBios_RawSMBiosTables -ErrorAction Stop | Select-Object -First 1
+    } catch { return $null }
+    if (-not $raw -or -not $raw.SMBiosData) { return $null }
+    if ($raw.SmbiosMajorVersion -lt 2 -or ($raw.SmbiosMajorVersion -eq 2 -and $raw.SmbiosMinorVersion -lt 7)) { return $null }
+
+    $data = [byte[]]$raw.SMBiosData
+    $offset = 0
+    while ($offset + 4 -le $data.Length) {
+        $type = $data[$offset]; $length = $data[$offset + 1]
+        if ($length -lt 4) { break }   # damaged table
+        if ($type -eq 0) {
+            if ($length -le 0x13 -or $offset + 0x13 -ge $data.Length) { return $null }
+            return [bool]($data[$offset + 0x13] -band 0x08)
+        }
+        if ($type -eq 127) { break }   # end of table
+        # Skip the fixed part, then the text strings that end with two zero bytes
+        $offset += $length
+        while ($offset + 1 -lt $data.Length -and -not ($data[$offset] -eq 0 -and $data[$offset + 1] -eq 0)) { $offset++ }
+        $offset += 2
+    }
+    $null
+}
+
+function Get-CpuTpmSupport {
+    <#
+        Guesses from the processor whether it has a TPM 2.0 built in
+        (Intel PTT / AMD fTPM): 'Yes', 'Maybe', 'No' or 'Unknown'.
+        Based on the processor generation, so it is a strong hint, not proof.
+    #>
+    param([string]$Name, [string]$Vendor)
+    if ($Vendor -eq 'AMD') {
+        if ($Name -match 'Ryzen|Threadripper|EPYC') { return 'Yes' }           # every Zen processor has fTPM
+        if ($Name -match 'Athlon.*\b(2\d\dGE?|3\d\d\dG[EU]?|Gold|Silver)\b') { return 'Yes' }   # Zen-based Athlons
+        if ($Name -match '\bFX(\(tm\))?-|Phenom|Athlon(\(tm\))? (II|64)|Sempron|Opteron') { return 'No' }
+        return 'Unknown'
+    }
+    if ($Vendor -eq 'Intel') {
+        if ($Name -match 'Core\(TM\) Ultra|Core Ultra') { return 'Yes' }
+        if ($Name -match 'Core\(TM\)2|Core 2|Pentium\(R\) (4|D)\b') { return 'No' }
+        if ($Name -match '\bi[3579]-(\d{3,5})') {
+            $model = $Matches[1]
+            # i7-920 = 1st gen, i5-2500 = 2nd ... i7-9700 = 9th, i7-10700 / i5-1135G7 = 10th/11th, i7-12700 = 12th
+            $gen = if ($model.Length -eq 3) { 1 }
+                   elseif ($model.Length -eq 5 -or $model[0] -eq '1') { [int]$model.Substring(0, 2) }
+                   else { [int]"$($model[0])" }
+            if ($gen -ge 8) { return 'Yes' }     # every 8th gen and newer Core has PTT
+            if ($gen -ge 4) { return 'Maybe' }   # PTT exists, but not every motherboard offers it
+            return 'No'
+        }
+    }
+    'Unknown'
+}
+
 function Get-CommonName {
     param($Certificate)
     if ($Certificate.Subject -match 'CN=([^,]+)') { $Matches[1].Trim('"') } else { $Certificate.Subject }
@@ -261,22 +324,44 @@ function Test-System {
     [pscustomobject]@{
         Vm        = $vm
         IsLaptop  = $isLaptop
+        CpuName   = "$($cpu.Name)".Trim()
         CpuVendor = switch -Wildcard ($cpu.Manufacturer) { 'AuthenticAMD' { 'AMD' } 'GenuineIntel' { 'Intel' } default { 'Other' } }
+        BiosDate  = $bios.ReleaseDate
         IsWin11   = [int]$os.BuildNumber -ge 22000
         Bios      = if (-not $vm) { Get-BiosKey -ComputerSystem $cs -IsLaptop $isLaptop }
     }
 }
 
 function Test-BootMode {
-    param([string]$Vm)
+    param($Pc)
+    $Vm = $Pc.Vm
     Write-Section 'Boot mode'
     $firmware = Get-FirmwareType
+    $script:UefiSupport = 'Yes'
     if ($firmware -eq 'UEFI') {
         Write-Item 'Firmware boot mode' 'UEFI' 'Ok'
         return $firmware
     }
 
     Write-Item 'Firmware boot mode' "$firmware (Secure Boot needs UEFI)" 'Fail'
+
+    # Is UEFI there at all? The firmware's self-description says so on most boards since about 2011;
+    # for older firmware that can't say, the BIOS date is the best hint (Secure Boot arrived around 2012).
+    $flag = Get-UefiSupportFlag
+    $year = if ($Pc.BiosDate) { ([datetime]$Pc.BiosDate).Year } else { $null }
+    $script:UefiSupport = if ($flag -eq $true) { 'Yes' }
+                          elseif ($flag -eq $false) { 'No' }
+                          elseif ($year -and $year -lt 2012) { 'Unlikely' }
+                          else { 'Unknown' }
+    if (-not $Vm) {
+        switch ($script:UefiSupport) {
+            'Yes'      { Write-Item 'UEFI support' 'yes (reported by the motherboard)' 'Ok' }
+            'No'       { Write-Item 'UEFI support' 'NO - the motherboard reports it has no UEFI' 'Fail' }
+            'Unlikely' { Write-Item 'UEFI support' "unlikely - BIOS from $year" 'Warn' }
+            default    { Write-Item 'UEFI support' 'the motherboard does not say' 'Info' }
+        }
+    }
+
     if ($Vm -eq 'Hyper-V') {
         Add-Problem -Area BootMode 'This is a Generation 1 Hyper-V virtual machine. Those boot with a legacy BIOS and can never use Secure Boot.' @(
             'Create a new Generation 2 virtual machine and install Windows in it (a VM cannot be converted from Gen 1 to Gen 2).'
@@ -286,13 +371,24 @@ function Test-BootMode {
             'Shut down the VM and switch its firmware to EFI / UEFI in the VM settings, then turn on Secure Boot there.',
             'The virtual disk must use GPT first - if it uses MBR, that step is listed before this one.'
         )
+    } elseif ($script:UefiSupport -eq 'No') {
+        Add-Problem -Area BootMode 'This motherboard does not support UEFI, so it cannot use Secure Boot. Its firmware reports a legacy BIOS only.' @(
+            'Check the PC or motherboard maker''s support page for a BIOS update - a few older boards got UEFI in a later update.',
+            'If there is none, this PC cannot run games that require Secure Boot. Only a newer motherboard (or PC) can fix that.',
+            'Do NOT convert the disk to GPT on this PC: without UEFI, Windows would no longer start.',
+            'If your BIOS setup does show a "UEFI" boot mode option anyway, the report is wrong - then follow the usual steps: convert the disk to GPT, switch to UEFI, disable CSM and enable Secure Boot.'
+        )
     } else {
-        Add-Problem -Area BootMode 'Windows was started in Legacy BIOS / CSM mode. Secure Boot only exists in UEFI mode, so it cannot be turned on yet.' @(
+        $steps = @()
+        if ($script:UefiSupport -eq 'Unlikely') {
+            $steps += "Your BIOS is from $year - many boards that old have no UEFI and no Secure Boot. First open the BIOS setup and check that it has a `"UEFI`" boot mode option. If it has none, this PC cannot use Secure Boot, and you should not convert the disk."
+        }
+        Add-Problem -Area BootMode 'Windows was started in Legacy BIOS / CSM mode. Secure Boot only exists in UEFI mode, so it cannot be turned on yet.' ($steps + @(
             'If the Windows disk still uses MBR, convert it to GPT first (that step is listed before this one) - otherwise Windows will not start in UEFI mode.',
             'In the BIOS/UEFI setup: set Boot mode to "UEFI" (not "Legacy" or "UEFI and Legacy") and disable CSM / Compatibility Support Module.',
             'Then enable Secure Boot (on some boards: set "OS Type" to "Windows UEFI mode", or Secure Boot mode to "Standard").',
             'Very old graphics cards (around 2012 and older) have no UEFI support and show a black screen without CSM. Use the integrated graphics or a newer card in that case.'
-        )
+        ))
     }
     $firmware
 }
@@ -318,6 +414,12 @@ function Test-BootDisk {
     Write-Item 'Partition style' "$($disk.PartitionStyle) (UEFI needs GPT)" $status
     if ($Firmware -eq 'UEFI') { return }   # booted fine anyway, nothing to fix
 
+    # Converting only makes sense if the board can start in UEFI mode - without it Windows would not start at all
+    if ($script:UefiSupport -eq 'No') {
+        Write-Item 'Convert to GPT' 'not suggested - this motherboard has no UEFI' 'Info'
+        return
+    }
+
     # MBR2GPT can convert the disk without reinstalling. /validate only checks, it changes nothing.
     $mbr2gpt = Join-Path $env:windir 'System32\mbr2gpt.exe'
     if (-not (Test-Path $mbr2gpt)) {
@@ -332,11 +434,15 @@ function Test-BootDisk {
     if ($LASTEXITCODE -eq 0) {
         Write-Item 'Convert without reinstall' 'possible (MBR2GPT check passed)' 'Ok'
         $script:NeedsConversion = $true
-        Add-Problem -Area Disk 'The Windows disk uses MBR. UEFI (and so Secure Boot) needs a GPT disk.' @(
+        $steps = @()
+        if ($script:UefiSupport -ne 'Yes') {
+            $steps += 'Before converting, open the BIOS setup and make sure it has a "UEFI" boot mode option. Without one, Windows will not start after the conversion.'
+        }
+        Add-Problem -Area Disk 'The Windows disk uses MBR. UEFI (and so Secure Boot) needs a GPT disk.' ($steps + @(
             'First read "Before you change anything" above: back up your files and take care of BitLocker.',
             "Convert the disk (takes a minute, designed to keep all files):  mbr2gpt /convert /allowFullOS /disk:$($disk.Number)",
             'Immediately afterwards switch the BIOS to UEFI mode - after the conversion Windows no longer starts in Legacy mode.'
-        )
+        ))
     } else {
         $reason = ($output -split "`r?`n" | Where-Object { $_ -match 'fail|error|cannot|unable|not ' } | Select-Object -First 3) -join ' '
         if (-not $reason) { $reason = "exit code $LASTEXITCODE" }
@@ -375,6 +481,23 @@ function Test-FirmwareKeys {
     $secureBoot   = Get-UefiFlag 'SecureBoot'
     $auditMode    = Get-UefiFlag 'AuditMode'
     $deployedMode = Get-UefiFlag 'DeployedMode'
+
+    # Firmware with Secure Boot always has these two settings, even with the keys wiped.
+    # If both are missing, the firmware has no Secure Boot feature at all.
+    if ($null -eq $setupMode -and $null -eq $secureBoot) {
+        Write-Item 'Secure Boot support' 'NO - the firmware has no Secure Boot settings' 'Fail'
+        if ($Vm) {
+            Add-Problem -Area SecureBoot "This $Vm virtual machine's firmware has no Secure Boot." @(
+                "Shut down the VM and turn on Secure Boot in the $Vm VM settings (it may need a newer $Vm version)."
+            )
+        } else {
+            Add-Problem -Area SecureBoot 'This motherboard''s firmware uses UEFI but has no Secure Boot feature (common on boards from around 2011-2012).' @(
+                'Check the PC or motherboard maker''s support page for a BIOS update - some boards got Secure Boot in a later update.',
+                'If there is none, this PC cannot run games that require Secure Boot. Only a newer motherboard (or PC) can fix that.'
+            )
+        }
+        return
+    }
 
     $pkBytes  = Get-UefiVariable 'PK'
     $pk  = @(if ($pkBytes)  { Get-SignatureCertificates $pkBytes })
@@ -523,11 +646,38 @@ function Test-Tpm {
                 "Shut down the VM and add a virtual TPM (vTPM) in the $($Pc.Vm) VM settings."
             )
         } else {
-            Add-Problem -Area Tpm 'No TPM was found. It is either switched off in the BIOS, or this PC has none.' @(
-                "In the BIOS/UEFI setup turn on $chipName. It is usually on the Security, Advanced or Trusted Computing page.",
-                'Most Intel and AMD processors from the last several years have a TPM 2.0 built in - it only needs to be switched on.',
-                'Older PCs without one need a TPM 2.0 module that plugs into the motherboard (check the motherboard manual for a "TPM" connector).'
-            )
+            # A switched-off TPM is invisible to Windows, so the processor decides how likely each answer is
+            $cpuTpm = Get-CpuTpmSupport -Name $Pc.CpuName -Vendor $Pc.CpuVendor
+            $module = 'A separate TPM 2.0 module that plugs into the motherboard - only if the board has a "TPM" connector (check the motherboard manual). Without one, this PC cannot get TPM 2.0.'
+            switch ($cpuTpm) {
+                'Yes' {
+                    Write-Item 'Built into processor' 'yes - so it is most likely just switched off' 'Info'
+                    Add-Problem -Area Tpm "No TPM was found. Your processor ($($Pc.CpuName)) has a TPM 2.0 built in, so it is most likely just switched off in the BIOS." @(
+                        "In the BIOS/UEFI setup turn on $chipName. It is usually on the Security, Advanced or Trusted Computing page."
+                    )
+                }
+                'Maybe' {
+                    Write-Item 'Built into processor' 'possibly - depends on the motherboard' 'Info'
+                    Add-Problem -Area Tpm "No TPM was found. Your processor ($($Pc.CpuName)) has a built-in TPM 2.0, but not every motherboard of that age offers it." @(
+                        "In the BIOS/UEFI setup look for $chipName and turn it on. It is usually on the Security, Advanced or Trusted Computing page.",
+                        "If the BIOS has no such option (also after a BIOS update), the only way is: $module"
+                    )
+                }
+                'No' {
+                    Write-Item 'Built into processor' 'no - this processor has no TPM 2.0' 'Fail'
+                    Add-Problem -Area Tpm "No TPM was found, and your processor ($($Pc.CpuName)) is too old to have a TPM 2.0 built in." @(
+                        "The only way is: $module",
+                        'If a TPM module is already fitted, it may be switched off - look for "TPM" or "Security Device Support" in the BIOS setup.'
+                    )
+                }
+                default {
+                    Add-Problem -Area Tpm 'No TPM was found. It is either switched off in the BIOS, or this PC has none.' @(
+                        "In the BIOS/UEFI setup turn on $chipName. It is usually on the Security, Advanced or Trusted Computing page.",
+                        'Most Intel and AMD processors from the last several years have a TPM 2.0 built in - it only needs to be switched on.',
+                        "If there is no such option: $module"
+                    )
+                }
+            }
         }
         return $false
     }
@@ -681,6 +831,8 @@ function Show-DataSafety {
         Write-Host '  About converting the disk (mbr2gpt /convert):' -ForegroundColor Yellow
         Write-Host '     - It is built to keep all your files, but it rewrites the layout of the disk. A power cut,'
         Write-Host '       crash or forced shutdown while it runs can leave Windows unable to start.'
+        Write-Host '     - Only convert if your BIOS setup has a "UEFI" boot mode option - without one, Windows'
+        Write-Host '       will not start after converting.'
         Write-Host '     - Back up anything you cannot re-download first (game saves, screenshots, documents,'
         Write-Host '       photos) to a USB drive or cloud storage.'
         Write-Host '     - On a laptop, plug in the charger. Close all programs and do not turn the PC off while it runs.'
@@ -731,7 +883,7 @@ Write-Host ' |  Any fix it shows is for you to decide on and do yourself.      |
 Write-Host ' +----------------------------------------------------------------+' -ForegroundColor Green
 
 $pc       = Test-System
-$firmware = Test-BootMode -Vm $pc.Vm
+$firmware = Test-BootMode -Pc $pc
 Test-BootDisk -Firmware $firmware
 $enabled  = $false
 $keysChecked = $firmware -eq 'UEFI'

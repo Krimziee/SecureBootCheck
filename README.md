@@ -32,18 +32,20 @@ Works on Windows 10 and Windows 11.
 
 | Check | What it finds |
 |---|---|
-| Boot mode | Whether Windows started in UEFI mode or old Legacy / CSM mode (Secure Boot needs UEFI) |
+| Boot mode | Whether Windows started in UEFI mode or old Legacy / CSM mode (Secure Boot needs UEFI), and whether the motherboard supports UEFI at all |
 | Windows disk | Whether the disk is GPT or MBR, and whether it can be converted without reinstalling Windows |
-| Secure Boot | Whether it's on, and if not, why: switched off in the BIOS, keys wiped, audit mode, or custom keys without Microsoft's certificate |
+| Secure Boot | Whether it's on, and if not, why: switched off in the BIOS, keys wiped, audit mode, custom keys without Microsoft's certificate, or a motherboard that has no Secure Boot at all |
 | Secure Boot keys | Missing Microsoft certificates, insecure test keys from the PC maker, and whether the 2023 certificate update is installed |
-| TPM 2.0 | Whether a TPM is there, switched on, version 2.0 and ready, and which BIOS setting to turn on (AMD fTPM / Intel PTT). Also warns if the TPM is locked after too many wrong PINs |
+| TPM 2.0 | Whether a TPM is there, switched on, version 2.0 and ready, and which BIOS setting to turn on (AMD fTPM / Intel PTT). If none is found, it uses your processor to tell whether it's most likely just switched off or your processor has none. Also warns if the TPM is locked after too many wrong PINs |
 | BitLocker | Whether your drive is encrypted and has a recovery key, so changing BIOS settings won't lock you out |
 
 It also detects your PC or motherboard brand and tells you which key opens its BIOS setup.
 
 **If it finds several problems**, it lists them as steps in the order you need to do them. For example, converting the disk comes before switching the BIOS to UEFI. Some settings can only be checked once the earlier steps are done, so run the check again afterwards.
 
-**What it can't see:** Windows can't look inside the BIOS menus, so it can't tell whether an option is greyed out or protected by a BIOS password. It also can't predict problems that only appear after Secure Boot is turned on, such as an old graphics card showing a black screen. In those cases it gives you the most likely settings to check.
+**If your hardware can't do it**, it says so plainly instead of sending you hunting for settings that don't exist. That covers a motherboard without UEFI, a UEFI firmware without Secure Boot, and a processor without a built-in TPM 2.0. It also never suggests converting your disk on a motherboard that can't start in UEFI mode.
+
+**What it can't see:** Windows can't look inside the BIOS menus, so it can't tell whether an option is greyed out or protected by a BIOS password. It also can't tell whether your motherboard has a connector for a separate TPM module; check the manual for that. It also can't predict problems that only appear after Secure Boot is turned on, such as an old graphics card showing a black screen. In those cases it gives you the most likely settings to check.
 
 ## Example
 
