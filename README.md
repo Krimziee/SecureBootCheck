@@ -114,4 +114,4 @@ This shows the text version. Add `-NoPause` to close the window right away when 
 
 ## License
 
-[MIT](LICENSE)
+[0BSD](LICENSE): use, change and share it freely, no credit needed.
