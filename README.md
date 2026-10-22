@@ -6,6 +6,12 @@ Games with kernel anti-cheat often refuse to start unless **Secure Boot** and **
 > **This tool makes no changes to your PC.**
 > It only *reads* your settings. It does not change BIOS settings, files, disks, BitLocker or the TPM, and it never restarts your PC. Every fix is shown as instructions: nothing happens unless you decide to do it yourself.
 
+## What it looks like
+
+![Secure Boot check](screenshots/secure-boot.png)
+
+Shown inside Krimz's Toolkit, where it is a tab.
+
 ## How to use it
 
 ### Option 1: one command (quickest)
