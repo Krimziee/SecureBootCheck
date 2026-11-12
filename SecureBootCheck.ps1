@@ -20,7 +20,7 @@
 #>
 param([switch]$NoPause, [switch]$Window, [switch]$LoadOnly)
 
-$script:Version = '1.0.2'
+$script:Version = '1.0.3'
 
 # ------------------------------------------------------------------
 #  Admin rights: the firmware variables can only be read as admin
