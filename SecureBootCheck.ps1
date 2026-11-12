@@ -308,6 +308,18 @@ function Get-CpuTpmSupport {
     'Unknown'
 }
 
+function Get-OldCertificateWording {
+    # "which expire in June 2026" / "which have started to expire" / "which have expired", from the
+    # dates inside Microsoft's 2011 certificates themselves, so the text is right whenever this runs
+    param($Certificates, [datetime]$Now = (Get-Date))
+    $dates = @($Certificates | Where-Object { $_ -and "$($_.Subject)" -match 'Microsoft' -and "$($_.Subject)" -match '2011' } |
+               ForEach-Object { [datetime]$_.NotAfter } | Sort-Object)
+    if ($dates.Count -eq 0)  { return 'which are being replaced by the 2023 ones' }
+    if ($Now -gt $dates[-1]) { return 'which have expired' }
+    if ($Now -gt $dates[0])  { return 'which have started to expire' }
+    'which expire in {0}' -f $dates[0].ToString('MMMM yyyy', [Globalization.CultureInfo]::InvariantCulture)
+}
+
 function Get-CommonName {
     param($Certificate)
     if ($Certificate.Subject -match 'CN=([^,]+)') { $Matches[1].Trim('"') } else { $Certificate.Subject }
@@ -317,12 +329,22 @@ function Get-CommonName {
 #  Checks
 # ------------------------------------------------------------------
 
+function Test-LaptopSigns {
+    # Decides from what the PC reports about itself. A battery only counts when nothing says
+    # "desktop": a UPS connected by USB shows up as a battery on a desktop PC.
+    param([int[]]$Chassis, $SystemType, [bool]$HasBattery)
+    $laptopChassis  = 8, 9, 10, 11, 12, 14, 18, 21, 30, 31, 32
+    $desktopChassis = 3, 4, 5, 6, 7, 13, 15, 17, 23, 24, 35, 36    # desktop, tower, all-in-one, server, mini PC...
+    if ($Chassis | Where-Object { $_ -in $laptopChassis }) { return $true }
+    if ($SystemType -eq 2) { return $true }                         # Windows' own "mobile" class
+    $looksDesktop = [bool]($Chassis | Where-Object { $_ -in $desktopChassis }) -or $SystemType -in 1, 3, 4, 5, 7
+    $HasBattery -and -not $looksDesktop
+}
+
 function Test-IsLaptop {
-    $laptopChassis = 8, 9, 10, 11, 12, 14, 18, 21, 30, 31, 32
-    $chassis = (Get-CimInstance Win32_SystemEnclosure).ChassisTypes
-    [bool](($chassis | Where-Object { $_ -in $laptopChassis }) -or
-           (Get-CimInstance Win32_ComputerSystem).PCSystemType -eq 2 -or
-           (Get-CimInstance Win32_Battery))
+    Test-LaptopSigns -Chassis @((Get-CimInstance Win32_SystemEnclosure).ChassisTypes | Where-Object { $_ }) `
+                     -SystemType (Get-CimInstance Win32_ComputerSystem).PCSystemType `
+                     -HasBattery ([bool](Get-CimInstance Win32_Battery))
 }
 
 function Get-BiosKey {
@@ -676,12 +698,13 @@ function Test-FirmwareKeys {
         }
     }
 
-    # ---- Certificate update (the 2011 certificates expire in 2026) ---
+    # ---- Certificate update (the 2011 certificates ran out during 2026) ---
     if (($win2011 -or $kek2011) -and -not ($win2023 -and $kek2023)) {
         $servicing = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\Servicing' -ErrorAction SilentlyContinue
         $state = if ($servicing.UEFICA2023Status) { " (Windows status: $($servicing.UEFICA2023Status))" } else { '' }
         Write-Item '2023 certificate update' "not installed yet$state" 'Warn'
-        Add-Warning "The firmware still only has Microsoft's 2011 Secure Boot certificates, which expire in 2026. Secure Boot keeps working, but this PC cannot receive new boot security fixes until the 2023 certificates are added.$state" @(
+        $old = Get-OldCertificateWording (@($kek) + @($db))
+        Add-Warning "The firmware still only has Microsoft's 2011 Secure Boot certificates, $old. Secure Boot keeps working, but this PC cannot receive new boot security fixes until the 2023 certificates are added.$state" @(
             'Install all Windows updates and reboot twice - Windows adds the 2023 certificates automatically.',
             'If it stays stuck, install the latest BIOS/UEFI update from the PC or motherboard maker.'
         )
